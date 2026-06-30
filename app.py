@@ -191,57 +191,55 @@ def analyze_semantic_pacing(text):
 
 
 # --- Signal 2: native stylometrics ------------------------------------------
-def _split_sentences(text):
-    """Naive sentence segmentation on terminal punctuation.
+def calculate_mattr(text, window_size=MATTR_WINDOW):
+    """Moving-Average Type-Token Ratio in [0.0, 1.0] (lexical diversity).
 
-    Good enough for length-variance statistics; we only need sentence *counts*
-    and their word lengths, not linguistically perfect boundaries.
+    Tokenizes `text` into lowercased alphanumeric word runs, slides a window of
+    `window_size` tokens across them, and averages the per-window unique-token
+    ratio. Unlike raw TTR, this is stable across text length.
+
+    Returns:
+        float in [0.0, 1.0] — *higher means more diverse* vocabulary. Returns
+        0.0 for empty input. When there are fewer tokens than `window_size`,
+        falls back to a single whole-text type-token ratio.
+    """
+    tokens = re.findall(r"[a-z0-9']+", text.lower())
+    if not tokens:
+        return 0.0
+
+    if len(tokens) < window_size:
+        return len(set(tokens)) / len(tokens)
+
+    ratios = [
+        len(set(tokens[i : i + window_size])) / window_size
+        for i in range(len(tokens) - window_size + 1)
+    ]
+    return statistics.fmean(ratios)
+
+
+def calculate_sentence_cv(text):
+    """Sentence-length uniformity score in [0.0 organic/human .. 1.0 uniform/AI].
+
+    Splits `text` on terminal punctuation (`.`, `!`, `?`), counts words per
+    sentence, and computes the coefficient of variation (std / mean) of those
+    counts. CV is scale-invariant, so the score is comparable whether a
+    submission runs short or long. The CV is then inverted and clamped against
+    `SENTENCE_CV_SCALE` (the CV that reads as "fully human"):
+
+        - high CV (bursty, human cadence)  -> approaches 0.0
+        - low  CV (uniform, AI cadence)    -> approaches 1.0
+
+    Returns:
+        float in [0.0, 1.0]. Returns a neutral 0.5 when there is too little
+        structure (fewer than two sentences, or a degenerate zero mean).
     """
     parts = re.split(r"[.!?]+", text)
-    return [p for p in (s.strip() for s in parts) if p]
-
-
-def _tokenize(text):
-    """Lowercased word tokens (alphanumeric runs), for TTR and word counts."""
-    return re.findall(r"[a-z0-9']+", text.lower())
-
-
-def _sentence_uniformity(sentences):
-    """Map sentence-length variation to [0.0 chaotic/human .. 1.0 uniform/AI].
-
-    Humans write in bursts (high length variance); machine text tends toward
-    uniform sentence lengths. We use the coefficient of variation (std / mean)
-    so the score is comparable regardless of average sentence length.
-    """
-    lengths = [len(s.split()) for s in sentences]
+    lengths = [len(s.split()) for s in (p.strip() for p in parts) if s.strip()]
     if len(lengths) < 2 or statistics.fmean(lengths) == 0:
-        # Too little structure to judge -> neutral.
         return 0.5
+
     cv = statistics.pstdev(lengths) / statistics.fmean(lengths)
-    # High CV -> human (0.0); CV at/above scale -> fully chaotic.
-    return max(0.0, 1.0 - cv / SENTENCE_CV_SCALE)
-
-
-def _lexical_uniformity(tokens):
-    """Map vocabulary diversity to [0.0 diverse/human .. 1.0 repetitive/AI].
-
-    Uses MATTR (moving-average type-token ratio) over a fixed window so the
-    score doesn't simply decay with text length the way raw TTR does. Low
-    diversity reads as uniform/AI (and, per spec, is the known poetry blind
-    spot the disagreement override exists to catch).
-    """
-    if not tokens:
-        return 0.5
-    if len(tokens) < MATTR_WINDOW:
-        mattr = len(set(tokens)) / len(tokens)
-    else:
-        windows = [
-            len(set(tokens[i : i + MATTR_WINDOW])) / MATTR_WINDOW
-            for i in range(len(tokens) - MATTR_WINDOW + 1)
-        ]
-        mattr = statistics.fmean(windows)
-    # High diversity -> human (0.0); low diversity -> uniform/AI.
-    return max(0.0, min(1.0, 1.0 - mattr))
+    return max(0.0, min(1.0, 1.0 - cv / SENTENCE_CV_SCALE))
 
 
 def analyze_stylometrics(text):
@@ -249,9 +247,13 @@ def analyze_stylometrics(text):
 
     Equal blend of sentence-length uniformity and lexical uniformity. Pure
     Python and deterministic, so it remains available when Signal 1 degrades.
+
+    `calculate_mattr` reports diversity (high = human), so it is inverted to a
+    uniformity score before blending; `calculate_sentence_cv` is already a
+    uniformity score, so both terms point the same way (1.0 = uniform/AI).
     """
-    sentence_score = _sentence_uniformity(_split_sentences(text))
-    lexical_score = _lexical_uniformity(_tokenize(text))
+    sentence_score = calculate_sentence_cv(text)
+    lexical_score = 1.0 - calculate_mattr(text)
     return 0.5 * sentence_score + 0.5 * lexical_score
 
 
