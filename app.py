@@ -1,0 +1,395 @@
+"""Provenance Guard — Flask application (Milestone 3 boilerplate).
+
+Scaffolds persistence and the submission intake path:
+  - SQLite (`provenance.db`) with a single `submissions` table.
+  - `POST /submit`  — validation guards + atomic write + contract-shaped response.
+  - `GET  /log`     — read-only monitoring of the last few records.
+
+Real detection signals / scoring (Milestone 4) and the appeal/resolve
+workflow (Milestone 5) are intentionally stubbed and marked below.
+"""
+
+import logging
+import os
+import re
+import sqlite3
+import statistics
+import uuid
+from datetime import datetime, timezone
+
+import groq
+from flask import Flask, g, jsonify, request
+
+# --- Constants (tunable, kept in one place per spec) -------------------------
+DB_PATH = "provenance.db"
+MIN_WORDS = 40          # minimum-length guard (planning.md §5.3)
+LOG_LIMIT = 10          # records returned by GET /log
+GROQ_MODEL = "llama-3.3-70b-versatile"  # Signal 1: semantic pacing analysis
+
+# Scoring weights and thresholds (planning.md §2 — tunable in one place).
+GROQ_WEIGHT = 0.6           # semantic judgment carries the heavier weight
+STYLO_WEIGHT = 0.4          # deterministic counterweight, works when degraded
+DISAGREEMENT_DELTA = 0.5    # |groq - stylo| above this forces UNCERTAIN
+HUMAN_THRESHOLD = 0.40      # final_score < this  -> likely human
+AI_THRESHOLD = 0.70         # final_score > this  -> likely AI
+
+# Stylometric tunables.
+MATTR_WINDOW = 50           # moving-average TTR window size (tokens)
+SENTENCE_CV_SCALE = 0.75    # sentence-length CV that maps to "fully human" (0.0)
+
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+#app.json.sort_keys = False
+
+
+# --- Database layer ----------------------------------------------------------
+def get_db():
+    """Return a per-request SQLite connection cached on Flask's `g`."""
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row  # dict-like row access
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exc):
+    """Close the request-scoped connection at the end of the context."""
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def init_db():
+    """Create the `submissions` table if it does not already exist.
+
+    `degraded` is stored as INTEGER (0/1) since SQLite has no native bool.
+    """
+    db = get_db()
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS submissions (
+            content_id        TEXT PRIMARY KEY,
+            text              TEXT NOT NULL,
+            final_score       REAL,
+            label             TEXT,
+            classification    TEXT,
+            groq_score        REAL,
+            stylometric_score REAL,
+            status            TEXT,
+            creator_reasoning TEXT,
+            degraded          INTEGER,
+            created_at        TEXT
+        )
+        """
+    )
+    db.commit()
+
+
+def insert_submission(record):
+    """Persist one submission as a single atomic transaction.
+
+    The `with` block commits on success and rolls back on exception, so the
+    audit log can never be left half-written (planning.md §Concurrency).
+    """
+    db = get_db()
+    with db:
+        db.execute(
+            """
+            INSERT INTO submissions (
+                content_id, text, final_score, label, classification,
+                groq_score, stylometric_score, status, creator_reasoning,
+                degraded, created_at
+            ) VALUES (
+                :content_id, :text, :final_score, :label, :classification,
+                :groq_score, :stylometric_score, :status, :creator_reasoning,
+                :degraded, :created_at
+            )
+            """,
+            record,
+        )
+
+
+# --- Helpers -----------------------------------------------------------------
+def error_response(message, code, http_status):
+    """Standard error shape per planning.md (all endpoints)."""
+    return jsonify({"error": message, "code": code}), http_status
+
+
+def validate_submission(payload):
+    """Validate a /submit payload.
+
+    Returns (text, None) on success, or (None, (message, code, status))
+    describing the failure.
+    """
+    if not isinstance(payload, dict):
+        return None, ("Request body must be a JSON object.", "bad_request", 400)
+
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None, ("Field 'text' is required and must be a string.", "bad_request", 400)
+
+    if len(text.split()) < MIN_WORDS:
+        return None, (
+            f"Text must contain at least {MIN_WORDS} words to be analyzed.",
+            "insufficient_text",
+            400,
+        )
+
+    return text, None
+
+
+# --- Scoring (Milestone 4 seam) ----------------------------------------------
+_PACING_SYSTEM_PROMPT = (
+    "You are a forensic text-pacing classifier. Analyze the semantic pacing of "
+    "the user's text — the rhythm, burstiness, and variation of how ideas unfold "
+    "— and judge whether it was written by a human or generated by an AI.\n"
+    "Respond with ONLY a single floating-point number between 0.0 and 1.0, where "
+    "0.0 means confidently human and 1.0 means confidently AI. Output nothing "
+    "else: no explanation, no labels, no markdown, no units, no surrounding text."
+)
+
+
+def analyze_semantic_pacing(text):
+    """Signal 1: score a text's semantic pacing as human-vs-AI via Groq.
+
+    Calls the Llama 3.3 70B model at temperature=0 for deterministic parsing,
+    instructing it to return only a bare float in [0.0, 1.0] (0.0 = confident
+    human, 1.0 = confident AI).
+
+    Returns:
+        (parsed_score: float, degraded: bool)
+        - On success: (score clamped to [0.0, 1.0], False).
+        - On any Groq error or unexpected failure: (0.0, True). A degraded
+          result signals upstream callers to fall back / down-weight Signal 1.
+    """
+    try:
+        client = groq.Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": _PACING_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        )
+        content = completion.choices[0].message.content
+        if content is None:
+            raise ValueError("Groq returned an empty message content.")
+        score = float(content.strip())
+        # Clamp defensively: the model can occasionally drift outside [0, 1].
+        score = max(0.0, min(1.0, score))
+        return score, False
+    except groq.GroqError as exc:
+        logger.error("Groq API call failed in analyze_semantic_pacing: %s", exc)
+        return 0.0, True
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully on any failure
+        logger.error(
+            "Unexpected failure in analyze_semantic_pacing: %s", exc, exc_info=True
+        )
+        return 0.0, True
+
+
+# --- Signal 2: native stylometrics ------------------------------------------
+def _split_sentences(text):
+    """Naive sentence segmentation on terminal punctuation.
+
+    Good enough for length-variance statistics; we only need sentence *counts*
+    and their word lengths, not linguistically perfect boundaries.
+    """
+    parts = re.split(r"[.!?]+", text)
+    return [p for p in (s.strip() for s in parts) if p]
+
+
+def _tokenize(text):
+    """Lowercased word tokens (alphanumeric runs), for TTR and word counts."""
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _sentence_uniformity(sentences):
+    """Map sentence-length variation to [0.0 chaotic/human .. 1.0 uniform/AI].
+
+    Humans write in bursts (high length variance); machine text tends toward
+    uniform sentence lengths. We use the coefficient of variation (std / mean)
+    so the score is comparable regardless of average sentence length.
+    """
+    lengths = [len(s.split()) for s in sentences]
+    if len(lengths) < 2 or statistics.fmean(lengths) == 0:
+        # Too little structure to judge -> neutral.
+        return 0.5
+    cv = statistics.pstdev(lengths) / statistics.fmean(lengths)
+    # High CV -> human (0.0); CV at/above scale -> fully chaotic.
+    return max(0.0, 1.0 - cv / SENTENCE_CV_SCALE)
+
+
+def _lexical_uniformity(tokens):
+    """Map vocabulary diversity to [0.0 diverse/human .. 1.0 repetitive/AI].
+
+    Uses MATTR (moving-average type-token ratio) over a fixed window so the
+    score doesn't simply decay with text length the way raw TTR does. Low
+    diversity reads as uniform/AI (and, per spec, is the known poetry blind
+    spot the disagreement override exists to catch).
+    """
+    if not tokens:
+        return 0.5
+    if len(tokens) < MATTR_WINDOW:
+        mattr = len(set(tokens)) / len(tokens)
+    else:
+        windows = [
+            len(set(tokens[i : i + MATTR_WINDOW])) / MATTR_WINDOW
+            for i in range(len(tokens) - MATTR_WINDOW + 1)
+        ]
+        mattr = statistics.fmean(windows)
+    # High diversity -> human (0.0); low diversity -> uniform/AI.
+    return max(0.0, min(1.0, 1.0 - mattr))
+
+
+def analyze_stylometrics(text):
+    """Signal 2: combined stylometric score in [0.0 human .. 1.0 AI].
+
+    Equal blend of sentence-length uniformity and lexical uniformity. Pure
+    Python and deterministic, so it remains available when Signal 1 degrades.
+    """
+    sentence_score = _sentence_uniformity(_split_sentences(text))
+    lexical_score = _lexical_uniformity(_tokenize(text))
+    return 0.5 * sentence_score + 0.5 * lexical_score
+
+
+# --- Confidence scoring engine -----------------------------------------------
+_LABELS = {
+    "human": (
+        "Verified Original: Our analysis indicates this content matches "
+        "human writing patterns."
+    ),
+    "uncertain": (
+        "Mixed Signatures: This text contains a blend of structural patterns "
+        "that make its origin ambiguous."
+    ),
+    "ai": (
+        "AI-Generated Pattern: This text closely aligns with algorithmic "
+        "generation characteristics."
+    ),
+}
+
+
+def _classify(final_score, disagreement):
+    """Resolve a final score (+ disagreement flag) to a classification key."""
+    if disagreement:
+        return "uncertain"
+    if final_score < HUMAN_THRESHOLD:
+        return "human"
+    if final_score > AI_THRESHOLD:
+        return "ai"
+    return "uncertain"
+
+
+def score_text(text):
+    """Run both signals, combine them, and produce a transparency label.
+
+    Flow (planning.md §2): Signal 1 (Groq) + Signal 2 (stylometrics) ->
+    weighted average (or Signal-2-only when degraded) -> disagreement override
+    -> classification band -> transparency label.
+    """
+    groq_score, degraded = analyze_semantic_pacing(text)
+    stylometric_score = analyze_stylometrics(text)
+
+    if degraded:
+        # Signal 1 unavailable: fall back to Signal 2 only. No disagreement
+        # check, since there is no trustworthy Groq score to compare against.
+        final_score = stylometric_score
+        disagreement = False
+    else:
+        final_score = GROQ_WEIGHT * groq_score + STYLO_WEIGHT * stylometric_score
+        disagreement = abs(groq_score - stylometric_score) > DISAGREEMENT_DELTA
+
+    classification = _classify(final_score, disagreement)
+
+    return {
+        "final_score": round(final_score, 2),
+        "classification": classification,
+        "label": _LABELS[classification],
+        "groq_score": round(groq_score, 2),
+        "stylometric_score": round(stylometric_score, 2),
+        "degraded": degraded,
+    }
+
+
+# --- Endpoints ---------------------------------------------------------------
+@app.route("/submit", methods=["POST"])
+def submit():
+    """Intake a text submission: validate, score (placeholder), persist."""
+    payload = request.get_json(silent=True)
+
+    text, err = validate_submission(payload)
+    if err is not None:
+        return error_response(*err)
+
+    scored = score_text(text)
+    record = {
+        "content_id": str(uuid.uuid4()),
+        "text": text,
+        "final_score": scored["final_score"],
+        "label": scored["label"],
+        "classification": scored["classification"],
+        "groq_score": scored["groq_score"],
+        "stylometric_score": scored["stylometric_score"],
+        "status": "classified",
+        "creator_reasoning": None,
+        "degraded": int(scored["degraded"]),
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    try:
+        insert_submission(record)
+    except sqlite3.Error:
+        return error_response("Failed to persist submission.", "server_error", 500)
+
+    return jsonify(
+        {
+            "content_id": record["content_id"],
+            "final_score": record["final_score"],
+            "label": record["label"],
+            "classification": record["classification"],
+            "signals": {
+                "groq": record["groq_score"],
+                "stylometric": record["stylometric_score"],
+            },
+            "status": record["status"],
+            "degraded": bool(record["degraded"]),
+            "created_at": record["created_at"],
+        }
+    ), 200
+
+
+@app.route("/log", methods=["GET"])
+def log():
+    """Read-only monitoring helper: the most recent submissions."""
+    try:
+        rows = (
+            get_db()
+            .execute(
+                "SELECT * FROM submissions ORDER BY created_at DESC LIMIT ?",
+                (LOG_LIMIT,),
+            )
+            .fetchall()
+        )
+    except sqlite3.Error:
+        return error_response("Failed to read submissions.", "server_error", 500)
+
+    return jsonify([dict(row) for row in rows]), 200
+
+
+@app.errorhandler(500)
+def handle_internal_error(exc):
+    """Return JSON (not an HTML stack trace) for unhandled server errors."""
+    return error_response("Internal server error.", "server_error", 500)
+
+
+# --- Startup -----------------------------------------------------------------
+# Ensure the schema exists before the first request is served.
+with app.app_context():
+    init_db()
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
