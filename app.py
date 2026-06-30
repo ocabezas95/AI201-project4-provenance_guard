@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 
 import groq
 from flask import Flask, g, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 # --- Constants (tunable, kept in one place per spec) -------------------------
 DB_PATH = "provenance.db"
@@ -37,10 +39,20 @@ AI_THRESHOLD = 0.70         # final_score > this  -> likely AI
 MATTR_WINDOW = 50           # moving-average TTR window size (tokens)
 SENTENCE_CV_SCALE = 0.75    # sentence-length CV that maps to "fully human" (0.0)
 
+# Rate limiting (planning.md §Milestone 5 — defensible /submit ceiling).
+SUBMIT_RATE_LIMITS = "10 per minute;100 per day"
+
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 #app.json.sort_keys = False
+
+# Track callers by remote IP; in-memory store per modern Flask-Limiter API.
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    storage_uri="memory://",
+)
 
 
 # --- Database layer ----------------------------------------------------------
@@ -79,10 +91,15 @@ def init_db():
             status            TEXT,
             creator_reasoning TEXT,
             degraded          INTEGER,
-            created_at        TEXT
+            created_at        TEXT,
+            resolved_at       TEXT
         )
         """
     )
+    # Migrate pre-existing databases that predate the resolved_at column.
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(submissions)")}
+    if "resolved_at" not in columns:
+        db.execute("ALTER TABLE submissions ADD COLUMN resolved_at TEXT")
     db.commit()
 
 
@@ -107,6 +124,30 @@ def insert_submission(record):
             )
             """,
             record,
+        )
+
+
+def get_submission(content_id):
+    """Fetch a single submission row by id, or None if it does not exist."""
+    return (
+        get_db()
+        .execute("SELECT * FROM submissions WHERE content_id = ?", (content_id,))
+        .fetchone()
+    )
+
+
+def update_submission(content_id, fields):
+    """Apply a partial update to one submission as a single atomic transaction.
+
+    `fields` maps column names to new values; the `with` block commits on
+    success and rolls back on exception, matching `insert_submission`.
+    """
+    assignments = ", ".join(f"{column} = :{column}" for column in fields)
+    db = get_db()
+    with db:
+        db.execute(
+            f"UPDATE submissions SET {assignments} WHERE content_id = :content_id",
+            {**fields, "content_id": content_id},
         )
 
 
@@ -137,6 +178,58 @@ def validate_submission(payload):
         )
 
     return text, None
+
+
+# Terminal outcomes a reviewer may assign via /resolve.
+_RESOLUTION_DECISIONS = ("upheld", "overturned")
+
+
+def validate_appeal(payload):
+    """Validate an /appeal payload.
+
+    Returns ((content_id, creator_reasoning), None) on success, or
+    (None, (message, code, status)) describing the failure.
+    """
+    if not isinstance(payload, dict):
+        return None, ("Request body must be a JSON object.", "bad_request", 400)
+
+    content_id = payload.get("content_id")
+    if not isinstance(content_id, str) or not content_id.strip():
+        return None, ("Field 'content_id' is required and must be a string.", "bad_request", 400)
+
+    creator_reasoning = payload.get("creator_reasoning")
+    if not isinstance(creator_reasoning, str) or not creator_reasoning.strip():
+        return None, (
+            "Field 'creator_reasoning' is required and must be a string.",
+            "bad_request",
+            400,
+        )
+
+    return (content_id, creator_reasoning), None
+
+
+def validate_resolve(payload):
+    """Validate a /resolve payload.
+
+    Returns ((content_id, decision), None) on success, or
+    (None, (message, code, status)) describing the failure.
+    """
+    if not isinstance(payload, dict):
+        return None, ("Request body must be a JSON object.", "bad_request", 400)
+
+    content_id = payload.get("content_id")
+    if not isinstance(content_id, str) or not content_id.strip():
+        return None, ("Field 'content_id' is required and must be a string.", "bad_request", 400)
+
+    decision = payload.get("decision")
+    if decision not in _RESOLUTION_DECISIONS:
+        return None, (
+            "Field 'decision' must be one of 'upheld' or 'overturned'.",
+            "bad_request",
+            400,
+        )
+
+    return (content_id, decision), None
 
 
 # --- Scoring (Milestone 4 seam) ----------------------------------------------
@@ -318,6 +411,7 @@ def score_text(text):
 
 # --- Endpoints ---------------------------------------------------------------
 @app.route("/submit", methods=["POST"])
+@limiter.limit(SUBMIT_RATE_LIMITS)
 def submit():
     """Intake a text submission: validate, score (placeholder), persist."""
     payload = request.get_json(silent=True)
@@ -379,6 +473,70 @@ def log():
         return error_response("Failed to read submissions.", "server_error", 500)
 
     return jsonify([dict(row) for row in rows]), 200
+
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    """Open an appeal: validate the id, move 'classified' -> 'under_review'."""
+    payload = request.get_json(silent=True)
+
+    parsed, err = validate_appeal(payload)
+    if err is not None:
+        return error_response(*err)
+    content_id, creator_reasoning = parsed
+
+    try:
+        if get_submission(content_id) is None:
+            return error_response("No submission found for that content_id.", "not_found", 404)
+        update_submission(
+            content_id,
+            {"status": "under_review", "creator_reasoning": creator_reasoning},
+        )
+    except sqlite3.Error:
+        return error_response("Failed to update submission.", "server_error", 500)
+
+    return jsonify({"content_id": content_id, "status": "under_review"}), 200
+
+
+@app.route("/resolve", methods=["POST"])
+def resolve():
+    """Close an appeal: 'under_review' -> terminal 'upheld' / 'overturned'."""
+    payload = request.get_json(silent=True)
+
+    parsed, err = validate_resolve(payload)
+    if err is not None:
+        return error_response(*err)
+    content_id, decision = parsed
+
+    try:
+        row = get_submission(content_id)
+        if row is None:
+            return error_response("No submission found for that content_id.", "not_found", 404)
+        # Only an appeal under review may transition to a terminal state
+        # (classified -> under_review -> {upheld | overturned}).
+        if row["status"] != "under_review":
+            return error_response(
+                "Submission must be under review before it can be resolved.",
+                "invalid_transition",
+                409,
+            )
+        update_submission(
+            content_id,
+            {
+                "status": decision,
+                "resolved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+    except sqlite3.Error:
+        return error_response("Failed to update submission.", "server_error", 500)
+
+    return jsonify({"content_id": content_id, "status": decision}), 200
+
+
+@app.errorhandler(429)
+def handle_rate_limit(exc):
+    """Return JSON (not Flask-Limiter's HTML) when a rate limit is exceeded."""
+    return error_response("Rate limit exceeded. Slow down.", "rate_limited", 429)
 
 
 @app.errorhandler(500)
